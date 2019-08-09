@@ -83,7 +83,7 @@ class TraceRecord:
         self.next_access_seq_no = next_access_seq_no
 
 
-class CacheEntry:
+class CacheEntry(object):
     """A cache entry stored in the cache."""
 
     def __init__(
@@ -95,7 +95,8 @@ class CacheEntry:
         table_id,
         access_number,
         time_s,
-        num_hits=0,
+        num_hits,
+        is_compressed,
     ):
         self.value_size = value_size
         self.last_access_number = access_number
@@ -106,6 +107,7 @@ class CacheEntry:
         self.last_access_time = time_s
         self.insertion_time = time_s
         self.table_id = table_id
+        self.is_compressed = is_compressed
 
     def __repr__(self):
         """Debug string."""
@@ -311,12 +313,14 @@ class MissRatioStats:
     def __init__(self, time_unit):
         self.num_misses = 0
         self.num_accesses = 0
+        self.num_decompressions = 0
         self.time_unit = time_unit
         self.time_misses = {}
         self.time_miss_bytes = {}
         self.time_accesses = {}
+        self.time_decompressions = {}
 
-    def update_metrics(self, access_time, is_hit, miss_bytes):
+    def update_metrics(self, access_time, is_hit, miss_bytes, does_decompress):
         access_time /= kMicrosInSecond * self.time_unit
         self.num_accesses += 1
         if access_time not in self.time_accesses:
@@ -329,10 +333,17 @@ class MissRatioStats:
                 self.time_miss_bytes[access_time] = 0
             self.time_misses[access_time] += 1
             self.time_miss_bytes[access_time] += miss_bytes
+        if does_decompress:
+            self.num_decompressions += 1
+            if access_time not in self.time_decompressions:
+                self.time_decompressions[access_time] = 0
+            self.time_decompressions[access_time] += 1
 
     def reset_counter(self):
         self.num_misses = 0
         self.num_accesses = 0
+        self.num_decompressions = 0
+        self.time_decompressions.clear()
         self.time_miss_bytes.clear()
         self.time_misses.clear()
         self.time_accesses.clear()
@@ -353,6 +364,9 @@ class MissRatioStats:
 
     def miss_ratio(self):
         return float(self.num_misses) * 100.0 / float(self.num_accesses)
+
+    def decompression_ratio(self):
+        return float(self.num_decompressions) * 100.0 / float(self.num_accesses)
 
     def write_miss_timeline(
         self, cache_type, cache_size, target_cf_name, result_dir, start, end
@@ -660,15 +674,17 @@ class Cache(object):
     replacement policies.
     """
 
-    def __init__(self, cache_size, enable_cache_row_key):
+    def __init__(self, cache_size, enable_cache_row_key, decompress_policy):
         self.cache_size = cache_size
         self.used_size = 0
         self.per_second_miss_ratio_stats = MissRatioStats(1)
         self.miss_ratio_stats = MissRatioStats(kSecondsInMinute)
         self.per_hour_miss_ratio_stats = MissRatioStats(kSecondsInHour)
-        # 0: disabled. 1: enabled. Insert both row and the refereneced data block.
+        # 0: disabled.
+        # 1: enabled. Insert both row and the refereneced data block.
         # 2: enabled. Insert only the row but NOT the referenced data block.
         self.enable_cache_row_key = enable_cache_row_key
+        self.decompress_policy = decompress_policy
         self.get_id_row_key_map = {}
         self.max_seen_get_id = 0
         self.retain_get_id_range = 100000
@@ -682,7 +698,7 @@ class Cache(object):
     def _lookup(self, trace_record, key, hash):
         """
         Look up the key in the cache.
-        Returns true upon a cache hit, false otherwise.
+        Returns the cached entry upon a cache hit, None otherwise.
         """
         raise NotImplementedError
 
@@ -693,7 +709,7 @@ class Cache(object):
         """
         raise NotImplementedError
 
-    def _insert(self, trace_record, key, hash, value_size):
+    def _insert(self, trace_record, key, hash, value_size, is_compressed):
         """
         Insert the new entry into the cache.
         """
@@ -707,6 +723,13 @@ class Cache(object):
         """
         raise NotImplementedError
 
+    def _delete(self, key, hash, entry):
+        """
+        Replace the compressed entry with the decompressed cache entry.
+        This may require evicting existing keys as the entry size increases.
+        """
+        raise NotImplementedError
+
     def cache_name(self):
         """
         The name of the replacement policy.
@@ -716,10 +739,16 @@ class Cache(object):
     def is_ml_cache(self):
         return False
 
-    def _update_stats(self, access_time, is_hit, miss_bytes):
-        self.per_second_miss_ratio_stats.update_metrics(access_time, is_hit, miss_bytes)
-        self.miss_ratio_stats.update_metrics(access_time, is_hit, miss_bytes)
-        self.per_hour_miss_ratio_stats.update_metrics(access_time, is_hit, miss_bytes)
+    def _update_stats(self, access_time, is_hit, miss_bytes, does_decompress):
+        self.per_second_miss_ratio_stats.update_metrics(
+            access_time, is_hit, miss_bytes, does_decompress
+        )
+        self.miss_ratio_stats.update_metrics(
+            access_time, is_hit, miss_bytes, does_decompress
+        )
+        self.per_hour_miss_ratio_stats.update_metrics(
+            access_time, is_hit, miss_bytes, does_decompress
+        )
 
     def access(self, trace_record):
         """
@@ -736,15 +765,19 @@ class Cache(object):
             # This is a get request.
             self._access_row(trace_record)
             return
-        is_hit = self._access_kv(
+        is_hit, does_decompress = self._access_kv(
             trace_record,
             self.block_key(trace_record),
             trace_record.block_id,
             trace_record.block_size,
             trace_record.no_insert,
+            is_block=True,
         )
         self._update_stats(
-            trace_record.access_time, is_hit=is_hit, miss_bytes=trace_record.block_size
+            trace_record.access_time,
+            is_hit=is_hit,
+            miss_bytes=trace_record.block_size,
+            does_decompress=does_decompress,
         )
 
     def _access_row(self, trace_record):
@@ -760,16 +793,22 @@ class Cache(object):
             # We treat future accesses as hits since this get request
             # completes.
             # print("row hit 1")
-            self._update_stats(trace_record.access_time, is_hit=True, miss_bytes=0)
+            self._update_stats(
+                trace_record.access_time,
+                is_hit=True,
+                miss_bytes=0,
+                does_decompress=False,
+            )
             return
         if row_key not in self.get_id_row_key_map[trace_record.get_id]:
             # First time seen this key.
-            is_hit = self._access_kv(
+            is_hit, _ = self._access_kv(
                 trace_record,
                 key=row_key,
                 hash=trace_record.key_id,
                 value_size=trace_record.kv_size,
                 no_insert=False,
+                is_block=False,
             )
             inserted = False
             if trace_record.kv_size > 0:
@@ -780,7 +819,12 @@ class Cache(object):
             # We treat future accesses as hits since this get request
             # completes.
             # print("row hit 2")
-            self._update_stats(trace_record.access_time, is_hit=True, miss_bytes=0)
+            self._update_stats(
+                trace_record.access_time,
+                is_hit=True,
+                miss_bytes=0,
+                does_decompress=False,
+            )
             return
         # Access its blocks.
         no_insert = trace_record.no_insert
@@ -790,15 +834,19 @@ class Cache(object):
             and trace_record.block_type == 9
         ):
             no_insert = True
-        is_hit = self._access_kv(
+        is_hit, does_decompress = self._access_kv(
             trace_record,
             key=self.block_key(trace_record),
             hash=trace_record.block_id,
             value_size=trace_record.block_size,
             no_insert=no_insert,
+            is_block=True,
         )
         self._update_stats(
-            trace_record.access_time, is_hit, miss_bytes=trace_record.block_size
+            trace_record.access_time,
+            is_hit,
+            miss_bytes=trace_record.block_size,
+            does_decompress=does_decompress,
         )
         if (
             trace_record.kv_size > 0
@@ -811,27 +859,149 @@ class Cache(object):
                 hash=trace_record.key_id,
                 value_size=trace_record.kv_size,
                 no_insert=False,
+                is_block=False,
             )
             # Mark as inserted.
             self.get_id_row_key_map[trace_record.get_id][row_key] = True
 
-    def _access_kv(self, trace_record, key, hash, value_size, no_insert):
+    def _access_kv(self, trace_record, key, hash, value_size, no_insert, is_block):
         # Sanity checks.
         assert self.used_size <= self.cache_size
-        if self._lookup(trace_record, key, hash):
+        decompressed_value_size = value_size
+        is_compressed = False
+        entry = self._lookup(trace_record, key, hash)
+        if entry is not None:
             # A cache hit.
-            return True
-        if no_insert or value_size <= 0:
-            return False
+            if not entry.is_compressed:
+                return True, False
+            # The entry is compressed.
+            decompressed_value_size = self.decompress_policy.should_decompress_cache_block(
+                entry, hash
+            )
+            if decompressed_value_size != entry.value_size:
+                # print("{}, {}".format(self.used_size, decompressed_value_size))
+                self._delete(key, hash, entry)
+                self.used_size -= entry.value_size
+                # print("{}, {}".format(self.used_size, decompressed_value_size))
+                self._evict(trace_record, key, hash, decompressed_value_size)
+                if self._should_admit(trace_record, key, hash, decompressed_value_size):
+                    self._insert(
+                        trace_record,
+                        key,
+                        hash,
+                        decompressed_value_size,
+                        is_compressed=False,
+                    )
+                    self.used_size += decompressed_value_size
+                # print("{}, {}".format(self.used_size, decompressed_value_size))
+            # Decompress the entry if it is compressed.
+            return True, True
+        if is_block:
+            decompressed_value_size = self.decompress_policy.should_insert_decompressed_block(
+                trace_record, hash
+            )
+            is_compressed = decompressed_value_size == value_size
+        if no_insert or decompressed_value_size <= 0:
+            return False, True
         # A cache miss.
-        if value_size > self.cache_size:
+        if decompressed_value_size > self.cache_size:
             # The block is too large to fit into the cache.
-            return False
-        self._evict(trace_record, key, hash, value_size)
-        if self._should_admit(trace_record, key, hash, value_size):
-            self._insert(trace_record, key, hash, value_size)
-            self.used_size += value_size
-        return False
+            return False, True
+        self._evict(trace_record, key, hash, decompressed_value_size)
+        if self._should_admit(trace_record, key, hash, decompressed_value_size):
+            self._insert(
+                trace_record, key, hash, decompressed_value_size, is_compressed
+            )
+            self.used_size += decompressed_value_size
+        # A cache miss will fetch the block and decompress it.
+        return False, True
+
+
+class DecompressPolicy(object):
+    def __init__(self, compression_ratios_dist):
+        # A probability distribution.
+        self.compression_ratios_dist = compression_ratios_dist
+        pass
+
+    def compressed_size(self, block_key, block_size):
+        return int(
+            self.compression_ratios_dist[block_key % len(self.compression_ratios_dist)]
+            * block_size
+        )
+
+    def decompressed_size(self, block_key, block_size):
+        return int(
+            block_size
+            / self.compression_ratios_dist[
+                block_key % len(self.compression_ratios_dist)
+            ]
+        )
+
+    def should_decompress_cache_block(self, entry, hash):
+        """
+        Return the original value size if it should not be decompresse.
+        Return the decompressed size otherwise.
+        """
+        raise NotImplementedError
+
+    def should_insert_decompressed_block(self, trace_record, hash):
+        """
+        Return the original value size if it should not be decompresse.
+        Return the decompressed size otherwise.
+        """
+        raise NotImplementedError
+
+
+class NoopDecompressPolicy(DecompressPolicy):
+    """
+    A noop decompress policy. The compression ratio is 1.
+    """
+
+    def __init__(self):
+        compression_ratios_dist = [1 for i in range(100)]
+        super(NoopDecompressPolicy, self).__init__(compression_ratios_dist)
+
+    def should_decompress_cache_block(self, entry, hash):
+        # Should never happen
+        raise NotImplementedError
+
+    def should_insert_decompressed_block(self, trace_record, hash):
+        # Always insert decompressed block
+        return self.decompressed_size(hash, trace_record.block_size)
+
+
+class AlwaysDecompressPolicy(DecompressPolicy):
+    """
+    Always decompress a block before putting it into the cache.
+    """
+
+    def should_decompress_cache_block(self, entry, hash):
+        # Should never happen
+        raise NotImplementedError
+
+    def should_insert_decompressed_block(self, trace_record, hash):
+        # Always insert decompressed block
+        return self.decompressed_size(hash, trace_record.block_size)
+
+
+class SelectiveDecompressPolicy(DecompressPolicy):
+    """
+    Upon a cache miss, put the compressed block in the cache.
+    When an entry observes X hits, decompresses it and put the decompressed block in the block.
+    """
+
+    def __init__(self, nhits, compression_ratios_dist):
+        super(SelectiveDecompressPolicy, self).__init__(compression_ratios_dist)
+        self.nhits = nhits
+
+    def should_decompress_cache_block(self, entry, hash):
+        if entry.is_compressed and entry.num_hits >= self.nhits:
+            return self.decompressed_size(hash, entry.value_size)
+        return entry.value_size
+
+    def should_insert_decompressed_block(self, trace_record, hash):
+        # Always insert compressed block.
+        return trace_record.block_size
 
 
 class CostClassEntry:
@@ -892,8 +1062,17 @@ class MLCache(Cache):
     policies using reinforcement learning.
     """
 
-    def __init__(self, cache_size, enable_cache_row_key, policies, cost_class_label):
-        super(MLCache, self).__init__(cache_size, enable_cache_row_key)
+    def __init__(
+        self,
+        cache_size,
+        enable_cache_row_key,
+        policies,
+        cost_class_label,
+        decompress_policy,
+    ):
+        super(MLCache, self).__init__(
+            cache_size, enable_cache_row_key, decompress_policy
+        )
         self.table = HashTable()
         self.policy_stats = PolicyStats(kSecondsInMinute, policies)
         self.per_hour_policy_stats = PolicyStats(kSecondsInHour, policies)
@@ -903,6 +1082,20 @@ class MLCache(Cache):
 
     def is_ml_cache(self):
         return True
+
+    def _delete(self, key, hash, entry):
+        assert self.table.delete(key, hash) is not None
+        # Update the entry's cost class statistics.
+        if self.cost_class_label is not None:
+            cost_class = entry.cost_class(self.cost_class_label)
+            assert cost_class in self.cost_classes
+            self.cost_classes[cost_class].remove(
+                entry.insertion_time,
+                entry.last_access_time,
+                key,
+                entry.value_size,
+                entry.num_hits,
+            )
 
     def _lookup(self, trace_record, key, hash):
         value = self.table.lookup(key, hash)
@@ -915,24 +1108,25 @@ class MLCache(Cache):
                     trace_record, value.last_access_time
                 )
             # Update the entry's last access time.
-            self.table.insert(
-                key,
-                hash,
-                CacheEntry(
-                    value_size=value.value_size,
-                    cf_id=value.cf_id,
-                    level=value.level,
-                    block_type=value.block_type,
-                    table_id=value.table_id,
-                    access_number=self.miss_ratio_stats.num_accesses,
-                    time_s=trace_record.access_time,
-                    num_hits=value.num_hits + 1,
-                ),
+            new_entry = CacheEntry(
+                value_size=value.value_size,
+                cf_id=value.cf_id,
+                level=value.level,
+                block_type=value.block_type,
+                table_id=value.table_id,
+                access_number=self.miss_ratio_stats.num_accesses,
+                time_s=trace_record.access_time,
+                num_hits=value.num_hits + 1,
+                is_compressed=value.is_compressed,
             )
-            return True
-        return False
+            self.table.insert(key, hash, new_entry)
+            return new_entry
+        return None
 
     def _evict(self, trace_record, key, hash, value_size):
+        if self.used_size + value_size <= self.cache_size:
+            # The cache size is large enough for the new entry.
+            return
         # Select a policy, random sample kSampleSize keys from the cache, then
         # evict keys in the sample set until we have enough room for the new
         # entry.
@@ -970,7 +1164,7 @@ class MLCache(Cache):
                 if self.used_size + value_size <= self.cache_size:
                     break
 
-    def _insert(self, trace_record, key, hash, value_size):
+    def _insert(self, trace_record, key, hash, value_size, is_compressed):
         assert self.used_size + value_size <= self.cache_size
         entry = CacheEntry(
             value_size,
@@ -980,6 +1174,8 @@ class MLCache(Cache):
             trace_record.table_id,
             self.miss_ratio_stats.num_accesses,
             trace_record.access_time,
+            num_hits=0,
+            is_compressed=is_compressed,
         )
         # Update the entry's cost class statistics.
         if self.cost_class_label is not None:
@@ -1012,11 +1208,16 @@ class ThompsonSamplingCache(MLCache):
         enable_cache_row_key,
         policies,
         cost_class_label,
+        decompress_policy,
         init_a=1,
         init_b=1,
     ):
         super(ThompsonSamplingCache, self).__init__(
-            cache_size, enable_cache_row_key, policies, cost_class_label
+            cache_size,
+            enable_cache_row_key,
+            policies,
+            cost_class_label,
+            decompress_policy,
         )
         self._as = {}
         self._bs = {}
@@ -1056,9 +1257,20 @@ class LinUCBCache(MLCache):
     DOI=http://dx.doi.org/10.1145/1772690.1772758
     """
 
-    def __init__(self, cache_size, enable_cache_row_key, policies, cost_class_label):
+    def __init__(
+        self,
+        cache_size,
+        enable_cache_row_key,
+        policies,
+        cost_class_label,
+        decompress_policy,
+    ):
         super(LinUCBCache, self).__init__(
-            cache_size, enable_cache_row_key, policies, cost_class_label
+            cache_size,
+            enable_cache_row_key,
+            policies,
+            cost_class_label,
+            decompress_policy,
         )
         self.nfeatures = 4  # Block type, level, cf.
         self.th = np.zeros((len(self.policies), self.nfeatures))
@@ -1104,17 +1316,40 @@ class LinUCBCache(MLCache):
         return "LinUCB with cost class {} (linucb)".format(self.cost_class_label)
 
 
-class OPTCacheEntry:
+class OPTCacheEntry(CacheEntry):
     """
     A cache entry for the OPT algorithm. The entries are sorted based on its
     next access sequence number in reverse order, i.e., the entry which next
     access is the furthest in the future is ordered before other entries.
     """
 
-    def __init__(self, key, next_access_seq_no, value_size):
+    def __init__(
+        self,
+        value_size,
+        cf_id,
+        level,
+        block_type,
+        table_id,
+        access_number,
+        time_s,
+        num_hits,
+        is_compressed,
+        key,
+        next_access_seq_no,
+    ):
+        super(OPTCacheEntry, self).__init__(
+            value_size,
+            cf_id,
+            level,
+            block_type,
+            table_id,
+            access_number,
+            time_s,
+            num_hits,
+            is_compressed,
+        )
         self.key = key
         self.next_access_seq_no = next_access_seq_no
-        self.value_size = value_size
         self.is_removed = False
 
     def __cmp__(self, other):
@@ -1150,6 +1385,15 @@ class PQTable:
         self.table[entry.key] = entry
         heapq.heappush(self.pq, entry)
         return removed_entry
+
+    def pqdelete(self, key):
+        "Delete a key"
+        # Remove the entry from the table.
+        removed_entry = self.table.pop(key, None)
+        if removed_entry:
+            # Mark as removed since there is no 'remove' API in heappq.
+            # Instead, an entry in pq is removed lazily when calling pop.
+            removed_entry.is_removed = True
 
     def pqpop(self):
         while self.pq:
@@ -1197,23 +1441,35 @@ class OPTCache(Cache):
     DOI=http://dx.doi.org/10.1147/sj.52.0078
     """
 
-    def __init__(self, cache_size):
-        super(OPTCache, self).__init__(cache_size, enable_cache_row_key=0)
+    def __init__(self, cache_size, decompress_policy):
+        super(OPTCache, self).__init__(
+            cache_size, enable_cache_row_key=0, decompress_policy=decompress_policy
+        )
         self.table = PQTable()
 
     def _lookup(self, trace_record, key, hash):
         if key not in self.table:
-            return False
+            return None
+        entry = self.table[key]
         # A cache hit. Update its next access time.
-        assert (
-            self.table.pqinsert(
-                OPTCacheEntry(
-                    key, trace_record.next_access_seq_no, self.table[key].value_size
-                )
-            )
-            is not None
+        new_entry = OPTCacheEntry(
+            entry.value_size,
+            entry.cf_id,
+            entry.level,
+            entry.block_type,
+            entry.table_id,
+            trace_record.seq_number,
+            trace_record.access_time,
+            entry.num_hits + 1,
+            entry.is_compressed,
+            key,
+            trace_record.next_access_seq_no,
         )
-        return True
+        assert self.table.pqinsert(new_entry) is not None
+        return new_entry
+
+    def _delete(self, key, hash, entry):
+        self.table.pqdelete(key)
 
     def _evict(self, trace_record, key, hash, value_size):
         while self.used_size + value_size > self.cache_size:
@@ -1221,13 +1477,22 @@ class OPTCache(Cache):
             assert evict_entry is not None
             self.used_size -= evict_entry.value_size
 
-    def _insert(self, trace_record, key, hash, value_size):
-        assert (
-            self.table.pqinsert(
-                OPTCacheEntry(key, trace_record.next_access_seq_no, value_size)
-            )
-            is None
+    def _insert(self, trace_record, key, hash, value_size, is_compressed):
+        entry = OPTCacheEntry(
+            value_size,
+            trace_record.cf_id,
+            trace_record.level,
+            trace_record.block_type,
+            trace_record.table_id,
+            trace_record.seq_number,
+            trace_record.access_time,
+            0,
+            is_compressed,
+            key,
+            trace_record.next_access_seq_no,
         )
+        entry.is_compressed = is_compressed
+        assert self.table.pqinsert(entry) is None
 
     def _should_admit(self, trace_record, key, hash, value_size):
         return True
@@ -1236,14 +1501,37 @@ class OPTCache(Cache):
         return "Belady MIN (opt)"
 
 
-class GDSizeEntry:
+class GDSizeCacheEntry(CacheEntry):
     """
     A cache entry for the greedy dual size replacement policy.
     """
 
-    def __init__(self, key, value_size, priority):
+    def __init__(
+        self,
+        value_size,
+        cf_id,
+        level,
+        block_type,
+        table_id,
+        access_number,
+        time_s,
+        num_hits,
+        is_compressed,
+        key,
+        priority,
+    ):
+        super(GDSizeCacheEntry, self).__init__(
+            value_size,
+            cf_id,
+            level,
+            block_type,
+            table_id,
+            access_number,
+            time_s,
+            num_hits,
+            is_compressed,
+        )
         self.key = key
-        self.value_size = value_size
         self.priority = priority
         self.is_removed = False
 
@@ -1270,8 +1558,10 @@ class GDSizeCache(Cache):
     in The 2nd Annual ACM-SIAM Symposium on Discrete Algorithms, 241-250, 1991.
     """
 
-    def __init__(self, cache_size, enable_cache_row_key):
-        super(GDSizeCache, self).__init__(cache_size, enable_cache_row_key)
+    def __init__(self, cache_size, enable_cache_row_key, decompress_policy):
+        super(GDSizeCache, self).__init__(
+            cache_size, enable_cache_row_key, decompress_policy
+        )
         self.table = PQTable()
         self.L = 0.0
 
@@ -1282,16 +1572,27 @@ class GDSizeCache(Cache):
 
     def _lookup(self, trace_record, key, hash):
         if key not in self.table:
-            return False
+            return None
         # A cache hit. Update its priority.
         entry = self.table[key]
-        assert (
-            self.table.pqinsert(
-                GDSizeEntry(key, entry.value_size, self.L + entry.value_size)
-            )
-            is not None
+        new_entry = GDSizeCacheEntry(
+            entry.value_size,
+            entry.cf_id,
+            entry.level,
+            entry.block_type,
+            entry.table_id,
+            trace_record.seq_number,
+            trace_record.access_time,
+            entry.num_hits + 1,
+            entry.is_compressed,
+            key,
+            self.L + entry.value_size,
         )
-        return True
+        assert self.table.pqinsert(new_entry) is not None
+        return new_entry
+
+    def _delete(self, key, hash, entry):
+        self.table.pqdelete(key)
 
     def _evict(self, trace_record, key, hash, value_size):
         while self.used_size + value_size > self.cache_size:
@@ -1300,11 +1601,22 @@ class GDSizeCache(Cache):
             self.L = evict_entry.priority
             self.used_size -= evict_entry.value_size
 
-    def _insert(self, trace_record, key, hash, value_size):
-        assert (
-            self.table.pqinsert(GDSizeEntry(key, value_size, self.L + value_size))
-            is None
+    def _insert(self, trace_record, key, hash, value_size, is_compressed):
+        entry = GDSizeCacheEntry(
+            value_size,
+            trace_record.cf_id,
+            trace_record.level,
+            trace_record.block_type,
+            trace_record.table_id,
+            trace_record.seq_number,
+            trace_record.access_time,
+            0,
+            is_compressed,
+            key,
+            self.L + value_size,
         )
+        entry.is_compressed = is_compressed
+        assert self.table.pqinsert(entry) is None
 
     def _should_admit(self, trace_record, key, hash, value_size):
         return True
@@ -1360,8 +1672,10 @@ class ARCCache(Cache):
     USA, 115-130.
     """
 
-    def __init__(self, cache_size, enable_cache_row_key):
-        super(ARCCache, self).__init__(cache_size, enable_cache_row_key)
+    def __init__(self, cache_size, enable_cache_row_key, decompress_policy):
+        super(ARCCache, self).__init__(
+            cache_size, enable_cache_row_key, decompress_policy
+        )
         self.table = {}
         self.c = cache_size / 16 * 1024  # Number of elements in the cache.
         self.p = 0  # Target size for the list T1
@@ -1390,16 +1704,35 @@ class ARCCache(Cache):
     def _lookup(self, trace_record, key, hash):
         # Case I: key is in T1 or T2.
         #   Move key to MRU position in T2.
+        if key not in self.table:
+            return None
+        entry = self.table[key]
+        new_entry = CacheEntry(
+            value_size=entry.value_size,
+            cf_id=entry.cf_id,
+            level=entry.level,
+            block_type=entry.block_type,
+            table_id=entry.table_id,
+            access_number=trace_record.seq_number,
+            time_s=trace_record.access_time,
+            num_hits=entry.num_hits + 1,
+            is_compressed=entry.is_compressed,
+        )
+        self.table[key] = new_entry
         if key in self.t1:
             self.t1.remove(key)
             self.t2.appendleft(key)
-            return True
-
         if key in self.t2:
             self.t2.remove(key)
             self.t2.appendleft(key)
-            return True
-        return False
+        return new_entry
+
+    def _delete(self, key, hash, entry):
+        if key in self.t1:
+            self.t1.remove(key)
+        if key in self.t2:
+            self.t2.remove(key)
+        del self.table[key]
 
     def _evict(self, trace_record, key, hash, value_size):
         # Case II: key is in B1
@@ -1433,16 +1766,19 @@ class ARCCache(Cache):
         self.t1.appendleft(key)
         return
 
-    def _insert(self, trace_record, key, hash, value_size):
-        self.table[key] = CacheEntry(
+    def _insert(self, trace_record, key, hash, value_size, is_compressed):
+        entry = CacheEntry(
             value_size,
             trace_record.cf_id,
             trace_record.level,
             trace_record.block_type,
             trace_record.table_id,
-            0,
+            trace_record.seq_number,
             trace_record.access_time,
+            0,
+            is_compressed,
         )
+        self.table[key] = entry
 
     def _should_admit(self, trace_record, key, hash, value_size):
         return True
@@ -1458,8 +1794,10 @@ class LRUCache(Cache):
     A strict LRU queue.
     """
 
-    def __init__(self, cache_size, enable_cache_row_key):
-        super(LRUCache, self).__init__(cache_size, enable_cache_row_key)
+    def __init__(self, cache_size, enable_cache_row_key, decompress_policy):
+        super(LRUCache, self).__init__(
+            cache_size, enable_cache_row_key, decompress_policy
+        )
         self.table = {}
         self.lru = Deque()
 
@@ -1470,11 +1808,28 @@ class LRUCache(Cache):
 
     def _lookup(self, trace_record, key, hash):
         if key not in self.table:
-            return False
+            return None
+        entry = self.table[key]
+        new_entry = CacheEntry(
+            value_size=entry.value_size,
+            cf_id=entry.cf_id,
+            level=entry.level,
+            block_type=entry.block_type,
+            table_id=entry.table_id,
+            access_number=trace_record.seq_number,
+            time_s=trace_record.access_time,
+            num_hits=entry.num_hits + 1,
+            is_compressed=entry.is_compressed,
+        )
+        self.table[key] = new_entry
         # A cache hit. Update LRU queue.
         self.lru.remove(key)
         self.lru.appendleft(key)
-        return True
+        return new_entry
+
+    def _delete(self, key, hash, entry):
+        del self.table[key]
+        self.lru.remove(key)
 
     def _evict(self, trace_record, key, hash, value_size):
         while self.used_size + value_size > self.cache_size:
@@ -1482,16 +1837,19 @@ class LRUCache(Cache):
             self.used_size -= self.table[evict_key].value_size
             del self.table[evict_key]
 
-    def _insert(self, trace_record, key, hash, value_size):
-        self.table[key] = CacheEntry(
+    def _insert(self, trace_record, key, hash, value_size, is_compressed):
+        entry = CacheEntry(
             value_size,
             trace_record.cf_id,
             trace_record.level,
             trace_record.block_type,
             trace_record.table_id,
-            0,
+            trace_record.seq_number,
             trace_record.access_time,
+            0,
+            is_compressed,
         )
+        self.table[key] = entry
         self.lru.appendleft(key)
 
     def _should_admit(self, trace_record, key, hash, value_size):
@@ -1505,15 +1863,32 @@ class TraceCache(Cache):
     """
 
     def __init__(self, cache_size):
-        super(TraceCache, self).__init__(cache_size, enable_cache_row_key=0)
+        super(TraceCache, self).__init__(
+            cache_size, enable_cache_row_key=0, decompress_policy=NoopDecompressPolicy()
+        )
 
     def _lookup(self, trace_record, key, hash):
-        return trace_record.is_hit
+        if trace_record.is_hit:
+            return CacheEntry(
+                0,
+                trace_record.cf_id,
+                trace_record.level,
+                trace_record.block_type,
+                trace_record.table_id,
+                trace_record.seq_number,
+                trace_record.access_time,
+                0,
+                False,
+            )
+        return None
 
     def _evict(self, trace_record, key, hash, value_size):
         pass
 
-    def _insert(self, trace_record, key, hash, value_size):
+    def _delete(self, key, hash, entry):
+        pass
+
+    def _insert(self, trace_record, key, hash, value_size, is_compressed):
         pass
 
     def _should_admit(self, trace_record, key, hash, value_size):
@@ -1534,7 +1909,19 @@ def parse_cache_size(cs):
     return int(cs)
 
 
-def create_cache(cache_type, cache_size, downsample_size):
+def create_decompression_policy(decompression_policy_name, compression_ratio_dist):
+    if decompression_policy_name == "ad":
+        return AlwaysDecompressPolicy(compression_ratio_dist)
+    elif "sd" in decompression_policy_name:
+        nhits = int(decompression_policy_name.split("_")[1])
+        return SelectiveDecompressPolicy(nhits, compression_ratio_dist)
+    else:
+        print("Unknown decompression policy {}".format(decompression_policy_name))
+        assert False
+    return None
+
+
+def create_cache(cache_type, cache_size, downsample_size, decompress_policy):
     cache_size = cache_size / downsample_size
     enable_cache_row_key = 0
     if "hybridn" in cache_type:
@@ -1549,6 +1936,7 @@ def create_cache(cache_type, cache_size, downsample_size):
             enable_cache_row_key,
             [LRUPolicy(), LFUPolicy(), HyperbolicPolicy()],
             cost_class_label=None,
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "linucb":
         return LinUCBCache(
@@ -1556,18 +1944,31 @@ def create_cache(cache_type, cache_size, downsample_size):
             enable_cache_row_key,
             [LRUPolicy(), LFUPolicy(), HyperbolicPolicy()],
             cost_class_label=None,
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "pylru":
         return ThompsonSamplingCache(
-            cache_size, enable_cache_row_key, [LRUPolicy()], cost_class_label=None
+            cache_size,
+            enable_cache_row_key,
+            [LRUPolicy()],
+            cost_class_label=None,
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "pymru":
         return ThompsonSamplingCache(
-            cache_size, enable_cache_row_key, [MRUPolicy()], cost_class_label=None
+            cache_size,
+            enable_cache_row_key,
+            [MRUPolicy()],
+            cost_class_label=None,
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "pylfu":
         return ThompsonSamplingCache(
-            cache_size, enable_cache_row_key, [LFUPolicy()], cost_class_label=None
+            cache_size,
+            enable_cache_row_key,
+            [LFUPolicy()],
+            cost_class_label=None,
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "pyhb":
         return ThompsonSamplingCache(
@@ -1575,6 +1976,7 @@ def create_cache(cache_type, cache_size, downsample_size):
             enable_cache_row_key,
             [HyperbolicPolicy()],
             cost_class_label=None,
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "pycctbbt":
         return ThompsonSamplingCache(
@@ -1582,10 +1984,15 @@ def create_cache(cache_type, cache_size, downsample_size):
             enable_cache_row_key,
             [CostClassPolicy()],
             cost_class_label="table_bt",
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "pycccf":
         return ThompsonSamplingCache(
-            cache_size, enable_cache_row_key, [CostClassPolicy()], cost_class_label="cf"
+            cache_size,
+            enable_cache_row_key,
+            [CostClassPolicy()],
+            cost_class_label="cf",
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "pycctblevelbt":
         return ThompsonSamplingCache(
@@ -1593,6 +2000,7 @@ def create_cache(cache_type, cache_size, downsample_size):
             enable_cache_row_key,
             [CostClassPolicy()],
             cost_class_label="table_level_bt",
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "pycccfbt":
         return ThompsonSamplingCache(
@@ -1600,6 +2008,7 @@ def create_cache(cache_type, cache_size, downsample_size):
             enable_cache_row_key,
             [CostClassPolicy()],
             cost_class_label="cf_bt",
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "pycctb":
         return ThompsonSamplingCache(
@@ -1607,27 +2016,32 @@ def create_cache(cache_type, cache_size, downsample_size):
             enable_cache_row_key,
             [CostClassPolicy()],
             cost_class_label="table",
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "pyccbt":
         return ThompsonSamplingCache(
-            cache_size, enable_cache_row_key, [CostClassPolicy()], cost_class_label="bt"
+            cache_size,
+            enable_cache_row_key,
+            [CostClassPolicy()],
+            cost_class_label="bt",
+            decompress_policy=decompress_policy,
         )
     elif cache_type == "opt":
         if enable_cache_row_key:
             print("opt does not support hybrid mode.")
             assert False
-        return OPTCache(cache_size)
+        return OPTCache(cache_size, decompress_policy)
     elif cache_type == "trace":
         if enable_cache_row_key:
             print("trace does not support hybrid mode.")
             assert False
         return TraceCache(cache_size)
     elif cache_type == "lru":
-        return LRUCache(cache_size, enable_cache_row_key)
+        return LRUCache(cache_size, enable_cache_row_key, decompress_policy)
     elif cache_type == "arc":
-        return ARCCache(cache_size, enable_cache_row_key)
+        return ARCCache(cache_size, enable_cache_row_key, decompress_policy)
     elif cache_type == "gdsize":
-        return GDSizeCache(cache_size, enable_cache_row_key)
+        return GDSizeCache(cache_size, enable_cache_row_key, decompress_policy)
     else:
         print("Unknown cache type {}".format(cache_type))
         assert False
@@ -1667,6 +2081,9 @@ def run(
     trace_file_path,
     cache_type,
     cache,
+    decompression_algorithm,
+    decompression_policy_name,
+    decompression_policy,
     warmup_seconds,
     max_accesses_to_process,
     target_cf_name,
@@ -1754,7 +2171,11 @@ def run(
     start_time = time.time()
     trace_start_time = 0
     trace_duration = 0
-    print("Running simulated {} cache on block traces.".format(cache.cache_name()))
+    print(
+        "Running simulated {} cache with decompression algorithm {} and policy {} on block traces.".format(
+            cache.cache_name(), decompression_algorithm, decompression_policy_name
+        )
+    )
     with open(trace_file_path, "r") as trace_file:
         for line in trace_file:
             if (
@@ -1808,8 +2229,16 @@ def run(
                 block_offset_in_file=int(ts[20]),
                 next_access_seq_no=next_access_seq_no,
             )
+            # Compress index and data block.
+            if record.block_type == 7 or record.block_type == 9:
+                record.block_size = decompression_policy.compressed_size(
+                    record.block_id, record.block_size
+                )
             trace_miss_ratio_stats.update_metrics(
-                record.access_time, is_hit=record.is_hit, miss_bytes=record.block_size
+                record.access_time,
+                is_hit=record.is_hit,
+                miss_bytes=record.block_size,
+                does_decompress=not record.is_hit,
             )
             cache.access(record)
             access_seq_no += 1
@@ -1833,7 +2262,9 @@ def run(
                 )
                 time_interval += 1
                 print(
-                    "{},0,0,{},{},{}".format(
+                    "{}_{}_{},0,0,{},{},{}".format(
+                        decompression_algorithm,
+                        decompression_policy_name,
                         cache_type,
                         cache.cache_size,
                         cache.miss_ratio_stats.miss_ratio(),
@@ -1852,7 +2283,9 @@ def run(
         )
     )
     print(
-        "{},0,0,{},{},{}".format(
+        "{}_{}_{},0,0,{},{},{}".format(
+            decompression_algorithm,
+            decompression_policy_name,
             cache_type,
             cache.cache_size,
             cache.miss_ratio_stats.miss_ratio(),
@@ -1863,6 +2296,8 @@ def run(
 
 
 def report_stats(
+    decompression_algorithm,
+    decompression_policy_name,
     cache,
     cache_type,
     cache_size,
@@ -1871,13 +2306,32 @@ def report_stats(
     trace_start_time,
     trace_end_time,
 ):
-    cache_label = "{}-{}-{}".format(cache_type, cache_size, target_cf_name)
+    cache_label = "{}_{}_{}-{}-{}".format(
+        decompression_algorithm,
+        decompression_policy_name,
+        cache_type,
+        cache_size,
+        target_cf_name,
+    )
+    decompression_cache_type = "{}_{}_{}".format(
+        cache_type, decompression_algorithm, decompression_policy_name
+    )
     with open("{}/data-ml-mrc-{}".format(result_dir, cache_label), "w+") as mrc_file:
         mrc_file.write(
             "{},0,0,{},{},{}\n".format(
-                cache_type,
+                decompression_cache_type,
                 cache_size,
                 cache.miss_ratio_stats.miss_ratio(),
+                cache.miss_ratio_stats.num_accesses,
+            )
+        )
+
+    with open("{}/data-ml-drc-{}".format(result_dir, cache_label), "w+") as mrc_file:
+        mrc_file.write(
+            "{},0,0,{},{},{}\n".format(
+                decompression_cache_type,
+                cache_size,
+                cache.miss_ratio_stats.decompression_ratio(),
                 cache.miss_ratio_stats.num_accesses,
             )
         )
@@ -1897,7 +2351,12 @@ def report_stats(
             "w+",
         ) as mb_file:
             mb_file.write(
-                "{},0,0,{},{}\n".format(cache_type, cache_size, avg_miss_bytes)
+                "{},0,0,{},{},{}\n".format(
+                    decompression_cache_type,
+                    cache_size,
+                    avg_miss_bytes,
+                    cache_stats[i].num_accesses,
+                )
             )
 
         with open(
@@ -1907,11 +2366,15 @@ def report_stats(
             "w+",
         ) as mb_file:
             mb_file.write(
-                "{},0,0,{},{}\n".format(cache_type, cache_size, p95_miss_bytes)
+                "{},0,0,{},{},{}\n".format(
+                    decompression_cache_type,
+                    cache_size,
+                    p95_miss_bytes,
+                    cache_stats[i].num_accesses,
+                )
             )
-
         cache_stats[i].write_miss_timeline(
-            cache_type,
+            decompression_cache_type,
             cache_size,
             target_cf_name,
             result_dir,
@@ -1919,7 +2382,7 @@ def report_stats(
             trace_end_time,
         )
         cache_stats[i].write_miss_ratio_timeline(
-            cache_type,
+            decompression_cache_type,
             cache_size,
             target_cf_name,
             result_dir,
@@ -1933,7 +2396,7 @@ def report_stats(
     policy_stats = [cache.policy_stats, cache.per_hour_policy_stats]
     for i in range(len(policy_stats)):
         policy_stats[i].write_policy_timeline(
-            cache_type,
+            decompression_cache_type,
             cache_size,
             target_cf_name,
             result_dir,
@@ -1941,7 +2404,7 @@ def report_stats(
             trace_end_time,
         )
         policy_stats[i].write_policy_ratio_timeline(
-            cache_type,
+            decompression_cache_type,
             cache_size,
             target_cf_name,
             result_dir,
@@ -1950,46 +2413,74 @@ def report_stats(
         )
 
 
+def parse_compression_ratio_dist(compression_ratio_dist_file_path):
+    compression_ratio_dist = {}
+    with open(compression_ratio_dist_file_path) as compression_ratio_dist_file:
+        for line in compression_ratio_dist_file:
+            ems = line.split(",")
+            compression_ratio_dist[ems[0]] = []
+            for i in range(1, len(ems)):
+                compression_ratio_dist[ems[0]].append(float(ems[i]))
+    return compression_ratio_dist
+
+
 if __name__ == "__main__":
-    if len(sys.argv) <= 8:
+    if len(sys.argv) <= 10:
         print(
             "Must provide 8 arguments.\n"
             "1) Cache type (ts, linucb, arc, lru, opt, pylru, pymru, pylfu, "
             "pyhb, gdsize, trace). One may evaluate the hybrid row_block cache "
             "by appending '_hybrid' to a cache_type, e.g., ts_hybrid. "
             "Note that hybrid is not supported with opt and trace. \n"
-            "2) Cache size (xM, xG, xT).\n"
-            "3) The sampling frequency used to collect the trace. (The "
+            "2) Decompression policy. \n"
+            "3) Decompression algorithm. \n"
+            "4) Cache size (xM, xG, xT).\n"
+            "5) The sampling frequency used to collect the trace. (The "
             "simulation scales down the cache size by the sampling frequency).\n"
-            "4) Warmup seconds (The number of seconds used for warmup).\n"
-            "5) Trace file path.\n"
-            "6) Result directory (A directory that saves generated results)\n"
-            "7) Max number of accesses to process\n"
-            "8) The target column family. (The simulation will only run "
+            "6) Warmup seconds (The number of seconds used for warmup).\n"
+            "7) Trace file path.\n"
+            "8) Result directory (A directory that saves generated results)\n"
+            "9) Max number of accesses to process\n"
+            "10) The target column family. (The simulation will only run "
             "accesses on the target column family. If it is set to all, "
-            "it will run against all accesses.)"
+            "it will run against all accesses.)\n"
+            "11) Compression ratio distribution file path"
         )
         exit(1)
     print("Arguments: {}".format(sys.argv))
     cache_type = sys.argv[1]
-    cache_size = parse_cache_size(sys.argv[2])
-    downsample_size = int(sys.argv[3])
-    warmup_seconds = int(sys.argv[4])
-    trace_file_path = sys.argv[5]
-    result_dir = sys.argv[6]
-    max_accesses_to_process = int(sys.argv[7])
-    target_cf_name = sys.argv[8]
+    decompression_policy_name = sys.argv[2]
+    decompression_algorithm = sys.argv[3]
+    cache_size = parse_cache_size(sys.argv[4])
+    downsample_size = int(sys.argv[5])
+    warmup_seconds = int(sys.argv[6])
+    trace_file_path = sys.argv[7]
+    result_dir = sys.argv[8]
+    max_accesses_to_process = int(sys.argv[9])
+    target_cf_name = sys.argv[10]
+    compression_ratio_dist_file_path = sys.argv[11]
     cache = create_cache(cache_type, cache_size, downsample_size)
+    compression_ratio_dist = parse_compression_ratio_dist(
+        compression_ratio_dist_file_path
+    )
+    decompression_policy = create_decompression_policy(
+        decompression_policy_name, compression_ratio_dist[decompression_algorithm]
+    )
     trace_start_time, trace_duration = run(
         trace_file_path,
         cache_type,
         cache,
+        decompression_algorithm,
+        decompression_policy_name,
+        decompression_policy,
         warmup_seconds,
         max_accesses_to_process,
         target_cf_name,
     )
     trace_end_time = trace_start_time + trace_duration
     report_stats(
+        decompression_algorithm,
+        decompression_policy_name,
         cache,
         cache_type,
         cache_size,

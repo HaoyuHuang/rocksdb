@@ -14,8 +14,8 @@
 # sudo dnf install -y numpy scipy python-matplotlib ipython python-pandas sympy python-nose atlas-devel
 ulimit -c 0
 
-if [ $# -ne 5 ]; then
-  echo "Usage: ./block_cache_pysim.sh trace_file_path result_dir downsample_size warmup_seconds max_jobs"
+if [ $# -ne 6 ]; then
+  echo "Usage: ./block_cache_pysim.sh trace_file_path result_dir downsample_size warmup_seconds max_jobs compression_ratio_dist_file_path"
   exit 0
 fi
 
@@ -24,6 +24,7 @@ result_dir="$2"
 downsample_size="$3"
 warmup_seconds="$4"
 max_jobs="$5"
+compression_ratio_dist_file_path="$6"
 max_num_accesses=100000000
 current_jobs=1
 
@@ -34,6 +35,11 @@ mkdir -p "$ml_tmp_result_dir"
 
 # Report miss ratio in the trace.
 current_jobs=$(ps aux | grep pysim | grep python | grep -cv grep)
+
+for decompression_policy_name in "ad" "sd_1" "sd_9999999999"
+do
+for decompression_algorithm in "zlib" "snappy"
+do
 for cf_name in "all"
 do
 for cache_size in "1G" "2G" "4G" "8G" "16G" #"12G" "16G" "1T"
@@ -51,10 +57,12 @@ do
       current_jobs=$(ps aux | grep pysim | grep python | grep -cv grep)
       echo "Waiting jobs to complete. Number of running jobs: $current_jobs"
     done
-    output="log-ml-$cache_type-$cache_size-$cf_name"
-    echo "Running simulation for $cache_type, cache size $cache_size, and cf_name $cf_name. Number of running jobs: $current_jobs. "
-    nohup python block_cache_pysim.py "$cache_type" "$cache_size" "$downsample_size" "$warmup_seconds" "$trace_file" "$ml_tmp_result_dir" "$max_num_accesses" "$cf_name" >& "$ml_tmp_result_dir/$output" &
+    output="log-ml-$decompression_policy_name-$decompression_algorithm-$cache_type-$cache_size-$cf_name"
+    echo "Running simulation for $decompression_policy_name, $decompression_algorithm, $cache_type, cache size $cache_size, and cf_name $cf_name. Number of running jobs: $current_jobs. "
+    nohup python block_cache_pysim.py "$decompression_policy_name" "$decompression_algorithm" "$cache_type" "$cache_size" "$downsample_size" "$warmup_seconds" "$trace_file" "$ml_tmp_result_dir" "$max_num_accesses" "$cf_name" "$compression_ratio_dist_file_path" >& "$ml_tmp_result_dir/$output" &
     current_jobs=$((current_jobs+1))
+done
+done
 done
 done
 done
@@ -117,6 +125,12 @@ do
     target_cf_name=${elements[-1]}
     sum_file="${result_dir}/ml_${target_cf_name}_mrc"
   fi
+  if [[ $fn == *"${header}ml-drc"* ]]; then
+    tmpfn="$fn"
+    IFS='-' read -ra elements <<< "$tmpfn"
+    target_cf_name=${elements[-1]}
+    sum_file="${result_dir}/ml_${target_cf_name}_drc"
+  fi
   if [[ $fn == *"${header}ml-avgmb"* ]]; then
     tmpfn="$fn"
     IFS='-' read -ra elements <<< "$tmpfn"
@@ -146,8 +160,8 @@ done
 echo "Done"
 for fn in $result_dir/*
 do
-  if [[ $fn == *"_mrc" || $fn == *"_avgmb" || $fn == *"_p95mb" ]]; then
-    # Sort MRC file by cache_type and cache_size.
+  if [[ $fn == *"_mrc" || $fn == *"_avgmb" || $fn == *"_p95mb" || $fn == *"_drc" ]]; then
+    # Sort MRC files by cache_type and cache_size.
     tmp_file="$result_dir/tmp_mrc"
     cat "$fn" | sort -t ',' -k1,1 -k4,4n > "$tmp_file"
     cat "$tmp_file" > "$fn"

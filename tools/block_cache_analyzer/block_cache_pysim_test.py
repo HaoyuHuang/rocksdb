@@ -6,6 +6,7 @@ import random
 import sys
 
 from block_cache_pysim import (
+    AlwaysDecompressPolicy,
     ARCCache,
     CacheEntry,
     GDSizeCache,
@@ -16,12 +17,15 @@ from block_cache_pysim import (
     LRUCache,
     LRUPolicy,
     MRUPolicy,
+    NoopDecompressPolicy,
     OPTCache,
     OPTCacheEntry,
+    SelectiveDecompressPolicy,
     ThompsonSamplingCache,
     TraceCache,
     TraceRecord,
     create_cache,
+    create_decompression_policy,
     kMicrosInSecond,
     kSampleSize,
     run,
@@ -84,6 +88,7 @@ def test_hash_table():
 
 
 def assert_metrics(cache, expected_value, expected_value_size=1, custom_hashtable=True):
+    # used size, num_accesses, num_misses, blocks, get_keys
     assert cache.used_size == expected_value[0], "Expected {}, Actual {}".format(
         expected_value[0], cache.used_size
     )
@@ -269,7 +274,13 @@ def test_mru_cache():
     policies.append(MRUPolicy())
     # Access k4, miss. evict k3
     test_cache(
-        ThompsonSamplingCache(3, False, policies, cost_class_label=None),
+        ThompsonSamplingCache(
+            3,
+            False,
+            policies,
+            cost_class_label=None,
+            decompress_policy=NoopDecompressPolicy(),
+        ),
         [3, 7, 4, [1, 2, 4], []],
     )
     print("Test MRU cache: Success")
@@ -281,7 +292,13 @@ def test_lfu_cache():
     policies.append(LFUPolicy())
     # Access k4, miss. evict k2
     test_cache(
-        ThompsonSamplingCache(3, False, policies, cost_class_label=None),
+        ThompsonSamplingCache(
+            3,
+            False,
+            policies,
+            cost_class_label=None,
+            decompress_policy=NoopDecompressPolicy(),
+        ),
         [3, 7, 4, [1, 3, 4], []],
     )
     print("Test LFU cache: Success")
@@ -331,8 +348,8 @@ def test_mix(cache):
         )
         cache.access(k)
     assert cache.miss_ratio_stats.miss_ratio() > 0
+    assert cache.miss_ratio_stats.num_accesses == n
     if cache.cache_name() == "Trace":
-        assert cache.miss_ratio_stats.num_accesses == n
         assert cache.miss_ratio_stats.num_misses == trace_num_misses
     else:
         assert cache.used_size <= cache.cache_size
@@ -405,8 +422,23 @@ def test_end_to_end():
         "pyccbt",
         "pycctbbt",
     ]:
-        cache = create_cache(cache_type, cache_size, downsample_size)
-        run(trace_file_path, cache_type, cache, 0, -1, "all")
+        cache = create_cache(
+            cache_type,
+            cache_size,
+            downsample_size,
+            decompress_policy=NoopDecompressPolicy(),
+        )
+        run(
+            trace_file_path,
+            cache_type,
+            cache,
+            decompression_algorithm="da_noop",
+            decompression_policy_name="dp_noop",
+            decompression_policy=NoopDecompressPolicy(),
+            warmup_seconds=0,
+            max_accesses_to_process=-1,
+            target_cf_name="all",
+        )
         cache_ms[cache_type] = cache
         assert cache.miss_ratio_stats.num_accesses == n
 
@@ -535,7 +567,7 @@ def test_hybrid(cache):
 
 def test_opt_cache():
     print("Test OPT cache")
-    cache = OPTCache(3)
+    cache = OPTCache(3, NoopDecompressPolicy())
     # seq:         0,  1,  2,  3,  4,  5,  6,  7,  8
     # key:         k1, k2, k3, k4, k5, k6, k7, k1, k8
     # next_access: 7,  19, 18, M,  M,  17, 16, 25, M
@@ -678,17 +710,155 @@ def test_trace_cache():
     print("Test trace cache: Success")
 
 
+def test_cache_compressed_blocks_always_decompress(cache, custom_hashtable):
+    print(
+        "Test caching compressed blocks always_decompress policy {} cache".format(
+            cache.cache_name()
+        )
+    )
+
+    compression_ratios_dist = [0.1 for i in range(100)]
+    cache.decompress_policy = AlwaysDecompressPolicy(compression_ratios_dist)
+    cache.cache_size = 1000
+    k1 = TraceRecord(
+        access_time=0,
+        block_id=1,
+        block_type=1,
+        block_size=10,
+        cf_id=0,
+        cf_name="",
+        level=0,
+        fd=0,
+        caller=0,
+        no_insert=0,
+        get_id=1,
+        key_id=1,
+        kv_size=5,
+        is_hit=1,
+        referenced_key_exist_in_block=1,
+        num_keys_in_block=0,
+        table_id=0,
+        seq_number=0,
+        block_key_size=0,
+        key_size=0,
+        block_offset_in_file=0,
+        next_access_seq_no=0,
+    )
+    cache.access(k1)
+    assert_metrics(
+        cache,
+        # used size, num_accesses, num_misses, blocks, get_keys
+        [100, 1, 1, [1], []],
+        expected_value_size=100,
+        custom_hashtable=custom_hashtable,
+    )
+    assert cache.miss_ratio_stats.num_decompressions == 1
+    cache.access(k1)
+    assert_metrics(
+        cache,
+        # used size, num_accesses, num_misses, blocks, get_keys
+        [100, 2, 1, [1], []],
+        expected_value_size=100,
+        custom_hashtable=custom_hashtable,
+    )
+    assert cache.miss_ratio_stats.num_decompressions == 1
+    print(
+        "Test caching compressed blocks always_decompress policy {} cache: Success".format(
+            cache.cache_name()
+        )
+    )
+
+
+def test_cache_compressed_blocks_selective_decompress(cache, custom_hashtable):
+    print(
+        "Test caching compressed blocks selective_decompress policy {} cache".format(
+            cache.cache_name()
+        )
+    )
+    compression_ratios_dist = [0.1 for i in range(100)]
+    cache.decompress_policy = SelectiveDecompressPolicy(1, compression_ratios_dist)
+    cache.cache_size = 1000
+    k1 = TraceRecord(
+        access_time=0,
+        block_id=1,
+        block_type=1,
+        block_size=10,
+        cf_id=0,
+        cf_name="",
+        level=0,
+        fd=0,
+        caller=0,
+        no_insert=0,
+        get_id=1,
+        key_id=1,
+        kv_size=5,
+        is_hit=1,
+        referenced_key_exist_in_block=1,
+        num_keys_in_block=0,
+        table_id=0,
+        seq_number=0,
+        block_key_size=0,
+        key_size=0,
+        block_offset_in_file=0,
+        next_access_seq_no=0,
+    )
+    # Should not decompress
+    cache.access(k1)
+    assert_metrics(
+        cache,
+        # used size, num_accesses, num_misses, blocks, get_keys
+        [10, 1, 1, [1], []],
+        expected_value_size=10,
+        custom_hashtable=custom_hashtable,
+    )
+    # The metric should be 1 since it is a miss.
+    assert cache.miss_ratio_stats.num_decompressions == 1
+    # Should decompress
+    cache.access(k1)
+    assert_metrics(
+        cache,
+        # used size, num_accesses, num_misses, blocks, get_keys
+        [100, 2, 1, [1], []],
+        expected_value_size=100,
+        custom_hashtable=custom_hashtable,
+    )
+    assert cache.miss_ratio_stats.num_decompressions == 2
+    # Should not decompress
+    cache.access(k1)
+    assert_metrics(
+        cache,
+        # used size, num_accesses, num_misses, blocks, get_keys
+        [100, 3, 1, [1], []],
+        expected_value_size=100,
+        custom_hashtable=custom_hashtable,
+    )
+    assert cache.miss_ratio_stats.num_decompressions == 2
+    print(
+        "Test caching compressed blocks selective_decompress policy {} cache: Success".format(
+            cache.cache_name()
+        )
+    )
+
+
 if __name__ == "__main__":
+    test_end_to_end()
     test_hash_table()
     test_trace_cache()
     test_opt_cache()
     test_lru_cache(
         ThompsonSamplingCache(
-            3, enable_cache_row_key=0, policies=[LRUPolicy()], cost_class_label=None
+            3,
+            enable_cache_row_key=0,
+            policies=[LRUPolicy()],
+            cost_class_label=None,
+            decompress_policy=NoopDecompressPolicy(),
         ),
         custom_hashtable=True,
     )
-    test_lru_cache(LRUCache(3, enable_cache_row_key=0), custom_hashtable=False)
+    test_lru_cache(
+        LRUCache(3, enable_cache_row_key=0, decompress_policy=NoopDecompressPolicy()),
+        custom_hashtable=False,
+    )
     test_mru_cache()
     test_lfu_cache()
     test_hybrid(
@@ -697,6 +867,7 @@ if __name__ == "__main__":
             enable_cache_row_key=1,
             policies=[LRUPolicy()],
             cost_class_label=None,
+            decompress_policy=NoopDecompressPolicy(),
         )
     )
     test_hybrid(
@@ -705,6 +876,7 @@ if __name__ == "__main__":
             enable_cache_row_key=1,
             policies=[LRUPolicy()],
             cost_class_label=None,
+            decompress_policy=NoopDecompressPolicy(),
         )
     )
     for cache_type in [
@@ -730,5 +902,46 @@ if __name__ == "__main__":
                     cache_type_str += "_hybrid"
                 elif enable_row_cache == 2:
                     cache_type_str += "_hybridn"
-            test_mix(create_cache(cache_type_str, cache_size=100, downsample_size=1))
-    test_end_to_end()
+            for decompression_policy_name in ["ad", "sd_1", "sd_" + str(sys.maxsize)]:
+                decompress_policy = create_decompression_policy(
+                    decompression_policy_name, [0.5 for i in range(100)]
+                )
+                test_mix(
+                    create_cache(
+                        cache_type_str,
+                        cache_size=100,
+                        downsample_size=1,
+                        decompress_policy=decompress_policy,
+                    )
+                )
+
+            if cache_type_str == "trace":
+                # TraceCache only reports cache hits.
+                continue
+
+            custom_hashtable = False
+            if (
+                cache_type.startswith("py")
+                or cache_type == "ts"
+                or cache_type == "linucb"
+            ):
+                custom_hashtable = True
+            print("testing {}".format(cache_type_str))
+            test_cache_compressed_blocks_always_decompress(
+                create_cache(
+                    cache_type_str,
+                    cache_size=100,
+                    downsample_size=1,
+                    decompress_policy=NoopDecompressPolicy(),
+                ),
+                custom_hashtable=custom_hashtable,
+            )
+            test_cache_compressed_blocks_selective_decompress(
+                create_cache(
+                    cache_type_str,
+                    cache_size=100,
+                    downsample_size=1,
+                    decompress_policy=NoopDecompressPolicy(),
+                ),
+                custom_hashtable=custom_hashtable,
+            )
